@@ -1,4 +1,5 @@
 Flask
+cors
 opencv-python-headless
 scikit-image
 fpdf

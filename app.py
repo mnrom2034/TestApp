@@ -1,6 +1,8 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 import os
 import tempfile
+import re
 from fpdf import FPDF
 from PIL import Image
 import yt_dlp
@@ -8,7 +10,13 @@ import cv2
 from skimage.metrics import structural_similarity as compare_ssim
 from youtube_transcript_api import YouTubeTranscriptApi
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static')
+CORS(app)
+
+# Serve the static index.html
+@app.route('/')
+def serve_static_index():
+    return send_from_directory(app.static_folder, 'index.html')
 
 # Reusing your existing functions
 def download_video(url, output_file):

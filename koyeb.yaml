@@ -1,0 +1,18 @@
+name: fastapi-youtube-downloader
+services:
+  - name: fastapi-app
+    build:
+      type: python
+      version: "3.9"
+    env:
+      - PYTHONUNBUFFERED=1
+    run:
+      cmd: uvicorn main:app --host 0.0.0.0 --port 8000
+    install:
+      commands:
+        - apt-get update
+        - apt-get install -y ffmpeg
+    routes:
+      - name: main-route
+        path: /
+        port: 8000

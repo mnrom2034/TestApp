@@ -1,24 +1,17 @@
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
+from flask import Flask, request, jsonify, send_file, render_template
 import os
 import tempfile
 import re
 from fpdf import FPDF
-from PIL import Image
+from youtube_transcript_api import YouTubeTranscriptApi
 import yt_dlp
 import cv2
 from skimage.metrics import structural_similarity as compare_ssim
-from youtube_transcript_api import YouTubeTranscriptApi
+from PIL import Image
 
-app = Flask(__name__, static_folder='static')
-CORS(app)
+app = Flask(__name__)
 
-# Serve the static index.html
-@app.route('/')
-def serve_static_index():
-    return send_from_directory(app.static_folder, 'index.html')
-
-# Reusing your existing functions
+# Helper functions for video download and processing
 def download_video(url, output_file):
     if os.path.exists(output_file):
         os.remove(output_file)
@@ -39,7 +32,8 @@ def get_video_id(url):
 def get_captions(video_id, lang='en'):
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=[lang])
-        return [(t['start'] * 1000, t['duration'] * 1000, t['text']) for t in transcript]
+        captions = [(t['start'] * 1000, t['duration'] * 1000, t['text']) for t in transcript]
+        return captions
     except Exception as e:
         print(f"Error fetching captions: {e}")
         return None
@@ -47,8 +41,10 @@ def get_captions(video_id, lang='en'):
 def extract_unique_frames(video_file, output_folder, n=3, ssim_threshold=0.8):
     cap = cv2.VideoCapture(video_file)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
-    last_frame, saved_frame = None, None
-    frame_number, last_saved_frame_number = 0, -1
+    last_frame = None
+    saved_frame = None
+    frame_number = 0
+    last_saved_frame_number = -1
     timestamps = []
 
     while cap.isOpened():
@@ -63,15 +59,19 @@ def extract_unique_frames(video_file, output_folder, n=3, ssim_threshold=0.8):
             if last_frame is not None:
                 similarity = compare_ssim(gray_frame, last_frame, data_range=gray_frame.max() - gray_frame.min())
 
-                if similarity < ssim_threshold and frame_number - last_saved_frame_number > fps:
-                    frame_path = os.path.join(output_folder, f'frame{frame_number:04d}.png')
-                    cv2.imwrite(frame_path, saved_frame)
-                    timestamps.append((frame_number, frame_number // fps))
+                if similarity < ssim_threshold:
+                    if saved_frame is not None and frame_number - last_saved_frame_number > fps:
+                        frame_path = os.path.join(output_folder, f'frame{frame_number:04d}_{frame_number // fps}.png')
+                        cv2.imwrite(frame_path, saved_frame)
+                        timestamps.append((frame_number, frame_number // fps))
 
                     saved_frame = frame
                     last_saved_frame_number = frame_number
+                else:
+                    saved_frame = frame
+
             else:
-                frame_path = os.path.join(output_folder, f'frame{frame_number:04d}.png')
+                frame_path = os.path.join(output_folder, f'frame{frame_number:04d}_{frame_number // fps}.png')
                 cv2.imwrite(frame_path, frame)
                 timestamps.append((frame_number, frame_number // fps))
                 last_saved_frame_number = frame_number
@@ -88,21 +88,37 @@ def convert_frames_to_pdf(input_folder, output_file, timestamps):
     pdf = FPDF("L")
     pdf.set_auto_page_break(0)
 
-    for i, frame_file in enumerate(frame_files):
+    for i, (frame_file, (frame_number, timestamp_seconds)) in enumerate(zip(frame_files, timestamps)):
         frame_path = os.path.join(input_folder, frame_file)
+        image = Image.open(frame_path)
         pdf.add_page()
         pdf.image(frame_path, x=0, y=0, w=pdf.w, h=pdf.h)
+
+        timestamp = f"{timestamp_seconds // 3600:02d}:{(timestamp_seconds % 3600) // 60:02d}:{timestamp_seconds % 60:02d}"
+
+        x, y, width, height = 5, 5, 60, 15
+        region = image.crop((x, y, x + width, y + height)).convert("L")
+        mean_pixel_value = region.resize((1, 1)).getpixel((0, 0))
+        if mean_pixel_value < 64:
+            pdf.set_text_color(255, 255, 255)
+        else:
+            pdf.set_text_color(0, 0, 0)
+
+        pdf.set_xy(x, y)
+        pdf.set_font("Arial", size=12)
+        pdf.cell(0, 0, timestamp)
 
     pdf.output(output_file)
 
 def create_transcripts_pdf(output_file, timestamps, captions):
     pdf = FPDF("P")
     pdf.set_auto_page_break(0)
-    caption_index = 0
     page_height = pdf.h
 
+    caption_index = 0
     for i, (frame_number, timestamp_seconds) in enumerate(timestamps):
         pdf.add_page()
+
         timestamp = f"{timestamp_seconds // 3600:02d}:{(timestamp_seconds % 3600) // 60:02d}:{timestamp_seconds % 60:02d}"
         pdf.set_text_color(0, 0, 0)
         pdf.set_xy(10, 10)
@@ -118,6 +134,7 @@ def create_transcripts_pdf(output_file, timestamps, captions):
                 transcript += f"{captions[caption_index][2]}\n"
                 caption_index += 1
 
+            pdf.set_text_color(0, 0, 0)
             pdf.set_xy(10, 25)
             pdf.set_font("Arial", size=10)
             lines = transcript.split("\n")
@@ -130,28 +147,27 @@ def create_transcripts_pdf(output_file, timestamps, captions):
 
     pdf.output(output_file)
 
-# Flask route to handle YouTube video processing
+# API Route for processing video and returning PDF files
 @app.route('/process', methods=['POST'])
 def process_video():
     data = request.json
-    video_url = data.get('url')
-    if not video_url:
-        return jsonify({"error": "No URL provided"}), 400
+    url = data.get('url')
+    
+    if not url:
+        return jsonify({'error': 'URL is required'}), 400
 
     try:
-        video_id = get_video_id(video_url)
-        if not video_id:
-            return jsonify({"error": "Invalid URL"}), 400
+        video_id = get_video_id(url)
+        video_title = "video"  # Simplified for this example
+        video_file = f"video_{video_id}.mp4"
+        download_video(url, video_file)
+
+        captions = get_captions(video_id)
+
+        output_pdf_filename = f"{video_title}.pdf"
+        transcript_pdf_filename = f"txt_{video_title}.pdf"
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            video_file = os.path.join(tmp_dir, f"video_{video_id}.mp4")
-            download_video(video_url, video_file)
-
-            captions = get_captions(video_id)
-
-            output_pdf_filename = os.path.join(tmp_dir, f"slides_{video_id}.pdf")
-            transcript_pdf_filename = os.path.join(tmp_dir, f"transcript_{video_id}.pdf")
-
             frames_folder = os.path.join(tmp_dir, "frames")
             os.makedirs(frames_folder)
 
@@ -160,21 +176,22 @@ def process_video():
             create_transcripts_pdf(transcript_pdf_filename, timestamps, captions)
 
             return jsonify({
-                "slides_pdf": output_pdf_filename,
-                "transcript_pdf": transcript_pdf_filename
+                'slide_pdf': f'/download/{output_pdf_filename}',
+                'transcript_pdf': f'/download/{transcript_pdf_filename}'
             })
-
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
-# Route to download files
-@app.route('/download', methods=['GET'])
-def download_file():
-    filename = request.args.get('filename')
-    if filename and os.path.exists(filename):
-        return send_file(filename, as_attachment=True)
-    return jsonify({"error": "File not found"}), 404
+# Route to serve the static HTML page
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000)
+# Route to handle file downloads
+@app.route('/download/<filename>', methods=['GET'])
+def download_file(filename):
+    return send_file(filename, as_attachment=True)
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
     
